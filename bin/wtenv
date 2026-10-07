@@ -1,0 +1,371 @@
+#!/usr/bin/env bash
+# wtenv — one developer environment per machine, every worktree in a second.
+#
+#   wtenv export [--format sh|claude] [--timeout SECONDS] [--no-build]
+#   wtenv exec -- <cmd> [args...]
+#   wtenv warm [--write FILE]
+#   wtenv gc [--days N]
+#   wtenv check            the miss-time path check on its own, no cache write
+#   wtenv key              the key and the entry this worktree would read
+#
+# The cache lives in the repository's git common dir:
+#
+#   <git-common-dir>/wtenv/<key>/<variant>/{env.sh,inputs,meta.json,gcroot*}
+#   <git-common-dir>/wtenv/<key>.lock
+#
+# <key> hashes the adapter's key files, the tool's version and the system.
+# <variant> hashes the inputs the evaluation read; a key holds one variant per
+# distinct content of those inputs, and a variant is valid while every input
+# still has its recorded hash.
+#
+# This is the spike's implementation: bash, run under bash 4 or later.
+
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+  for b in ${WTENV_BASH:-} /run/current-system/sw/bin/bash /opt/homebrew/bin/bash /usr/local/bin/bash "$HOME/.nix-profile/bin/bash"; do
+    if [ -x "$b" ] && "$b" -c '[ "${BASH_VERSINFO[0]}" -ge 4 ]' 2>/dev/null; then
+      exec "$b" "$0" "$@"
+    fi
+  done
+  echo "wtenv: needs bash 4 or later (set WTENV_BASH)" >&2
+  exit 1
+fi
+
+set -euo pipefail
+
+WTENV_HOME="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+WTENV_LOG="${WTENV_LOG:-}"
+
+# Variables never carried from an adapter's environment into a caller's: the
+# shell's own, and the temp dirs a Nix build environment points at its build
+# directory.
+WTENV_EXCLUDE=" PWD OLDPWD SHLVL _ SHELL TMPDIR TMP TEMP TEMPDIR NIX_BUILD_TOP CLAUDE_ENV_FILE DEVENV_CMDLINE HOME USER LOGNAME TERM "
+
+die() { echo "wtenv: $*" >&2; exit 1; }
+log() { [ -n "${WTENV_QUIET:-}" ] || echo "wtenv: $*" >&2; }
+now_ms() { local t; t=$(date +%s%N 2>/dev/null); case "$t" in *N) python3 -c 'import time;print(int(time.time()*1000))' ;; *) echo $((t / 1000000)) ;; esac; }
+
+sha256_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -c1-64; else shasum -a 256 | cut -c1-64; fi
+}
+# sha256 of each named file, "<hash>  <name>" per line; "absent" for a missing
+# file and "dir:<hash of the listing>" for a directory.
+hash_files() {
+  local f
+  for f in "$@"; do
+    if [ -d "$f" ]; then
+      printf 'dir:%s  %s\n' "$(ls -1A "$f" | sha256_stdin)" "$f"
+    elif [ -e "$f" ]; then
+      printf '%s  %s\n' "$(sha256_stdin <"$f")" "$f"
+    else
+      printf 'absent  %s\n' "$f"
+    fi
+  done
+}
+
+# POSIX single-quote escaping: reads identically in sh, bash and zsh.
+shq() { local s=${1//\'/\'\\\'\'}; printf "'%s'" "$s"; }
+
+# ---------------------------------------------------------------------------
+# Root and adapter
+# ---------------------------------------------------------------------------
+
+find_root() {
+  ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || ROOT=""
+  [ -n "$ROOT" ] || die "not in a git worktree"
+  COMMON="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir)"
+  CACHE="${WTENV_CACHE:-$COMMON/wtenv}"
+}
+
+load_adapter() {
+  local a
+  for a in "$WTENV_HOME"/adapters/*.sh; do
+    # shellcheck source=/dev/null
+    . "$a"
+  done
+  ADAPTER=""
+  for a in devenv flake mise; do
+    declare -F "adapter_${a}_detect" >/dev/null || continue
+    if "adapter_${a}_detect" "$ROOT"; then ADAPTER=$a; break; fi
+  done
+  [ -n "$ADAPTER" ] || return 1
+}
+ad() { local f="adapter_${ADAPTER}_$1"; shift; "$f" "$@"; }
+
+compute_key() {
+  local files f
+  files="$(cd "$ROOT" && ad key_files)"
+  KEY="$( {
+    echo "adapter $ADAPTER $(sha256_stdin <"$WTENV_HOME/adapters/$ADAPTER.sh")"
+    echo "version $(ad tool_version)"
+    echo "system $(uname -sm)"
+    cd "$ROOT"
+    while IFS= read -r f; do [ -n "$f" ] && hash_files "$f"; done <<<"$files"
+  } | sha256_stdin | cut -c1-16)"
+}
+
+# A variant is valid while every recorded input has its hash. Inputs under the
+# root are recorded relative to it and checked in this worktree.
+variant_valid() {
+  local entry=$1 hash path cur
+  [ -f "$entry/env.sh" ] && [ -f "$entry/inputs" ] || return 1
+  while IFS= read -r line; do
+    hash=${line%%  *}; path=${line#*  }
+    case "$path" in /*) ;; *) path="$ROOT/$path" ;; esac
+    cur="$(hash_files "$path")"; cur=${cur%%  *}
+    [ "$cur" = "$hash" ] || return 1
+  done <"$entry/inputs"
+}
+
+find_entry() {
+  local v
+  ENTRY=""
+  for v in "$CACHE/$KEY"/*/; do
+    [ -d "$v" ] || continue
+    if variant_valid "${v%/}"; then ENTRY="${v%/}"; return 0; fi
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Lock: a directory made atomically, holding the holder's pid. A lock whose
+# holder is gone is taken over.
+# ---------------------------------------------------------------------------
+
+lock_take() {
+  local lock=$1
+  if mkdir "$lock" 2>/dev/null; then echo $$ >"$lock/pid"; return 0; fi
+  local pid; pid="$(cat "$lock/pid" 2>/dev/null || true)"
+  if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+    rm -rf "$lock"
+    if mkdir "$lock" 2>/dev/null; then echo $$ >"$lock/pid"; return 0; fi
+  fi
+  return 1
+}
+lock_release() { rm -rf "$1"; }
+
+# ---------------------------------------------------------------------------
+# Environment diff: NUL-separated `env -0` dumps in, export/unset lines out.
+# A value that is the old one with something put before or after it is
+# written relative to the variable, so PATH keeps the caller's own entries.
+# ---------------------------------------------------------------------------
+
+read_env0() { # file -> assoc array named $2
+  local -n _m=$2; local kv
+  while IFS= read -r -d '' kv; do
+    case "$kv" in *=*) ;; *) continue ;; esac
+    _m["${kv%%=*}"]="${kv#*=}"
+  done <"$1"
+}
+
+env_diff() { # before after
+  local -A b=() a=(); read_env0 "$1" b; read_env0 "$2" a
+  local k v o
+  for k in $(printf '%s\n' "${!a[@]}" | LC_ALL=C sort); do
+    [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    case "$WTENV_EXCLUDE" in *" $k "*) continue ;; esac
+    v=${a[$k]}
+    if [ "${b[$k]+set}" = set ]; then
+      o=${b[$k]}
+      [ "$v" = "$o" ] && continue
+      if [ -n "$o" ] && [ "${v%":$o"}" != "$v" ]; then
+        printf 'export %s=%s"${%s:+:$%s}"\n' "$k" "$(shq "${v%":$o"}")" "$k" "$k"; continue
+      fi
+      if [ -n "$o" ] && [ "${v#"$o:"}" != "$v" ]; then
+        printf 'export %s="${%s:+$%s:}"%s\n' "$k" "$k" "$k" "$(shq "${v#"$o:"}")"; continue
+      fi
+    fi
+    printf 'export %s=%s\n' "$k" "$(shq "$v")"
+  done
+  for k in $(printf '%s\n' "${!b[@]}" | LC_ALL=C sort); do
+    [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    case "$WTENV_EXCLUDE" in *" $k "*) continue ;; esac
+    [ "${a[$k]+set}" = set ] || printf 'unset %s\n' "$k"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Build (a miss) and render (every export)
+# ---------------------------------------------------------------------------
+
+build_entry() {
+  local tmp t0 t1 variant
+  t0=$(now_ms)
+  tmp="$(mktemp -d "$CACHE/$KEY/.build.XXXXXX")"
+  log "miss: evaluating $ADAPTER environment for $ROOT (key $KEY)"
+  if ! (cd "$ROOT" && ad export "$tmp") >"$tmp/export.log" 2>&1; then
+    cat "$tmp/export.log" >&2; rm -rf "$tmp"; die "$ADAPTER export failed"
+  fi
+  # The template: the worktree's own paths written as placeholders, and every
+  # remaining occurrence of the root refused.
+  if ! (cd "$ROOT" && ad templatize "$tmp") >"$tmp/check.out"; then
+    # Refused: this worktree is served from its own evaluation, and nothing
+    # is stored for another to read.
+    cat "$tmp/check.out" >&2
+    echo "wtenv: not cached: the environment carries this worktree's path (above)" >&2
+    ENTRY="$tmp"; UNCACHED=1
+    return 0
+  fi
+  variant="$(sha256_stdin <"$tmp/inputs" | cut -c1-16)"
+  t1=$(now_ms)
+  cat >"$tmp/meta.json" <<EOF
+{"adapter":"$ADAPTER","version":"$(ad tool_version)","system":"$(uname -sm)","key":"$KEY","variant":"$variant","built_from":"$ROOT","created":$(date +%s),"build_ms":$((t1 - t0))}
+EOF
+  touch "$tmp/last-used"
+  rm -f "$tmp/raw.sh" "$tmp/export.log"
+  if [ -d "$CACHE/$KEY/$variant" ]; then rm -rf "$tmp"; else mv "$tmp" "$CACHE/$KEY/$variant"; fi
+  ENTRY="$CACHE/$KEY/$variant"
+  if declare -F "adapter_${ADAPTER}_gcroot" >/dev/null; then ad gcroot "$ENTRY"; fi
+  log "stored $ENTRY, built in $(((t1 - t0) / 1000)) s"
+}
+
+ensure_entry() {
+  local timeout=${1:-0} waited=0 lock="$CACHE/$KEY.lock"
+  mkdir -p "$CACHE/$KEY"
+  find_entry && return 0
+  while ! lock_take "$lock"; do
+    # Another process is building this key: wait, then read what it stored.
+    if [ "$timeout" -gt 0 ] && [ "$waited" -ge $((timeout * 10)) ]; then return 2; fi
+    sleep 0.1; waited=$((waited + 1))
+    [ -d "$lock" ] || { find_entry && return 0; }
+  done
+  trap 'lock_release "$lock"' EXIT
+  if ! find_entry; then build_entry; fi
+  lock_release "$lock"; trap - EXIT
+}
+
+# The environment for this worktree: the template with this worktree's values
+# put back, then the adapter's per-worktree step, all diffed against the
+# caller's environment.
+render() {
+  local work; work="$(mktemp -d "${TMPDIR:-/tmp}/wtenv.XXXXXX")"
+  ad render "$ENTRY" "$work"
+  env -0 >"$work/before"
+  ad apply "$ENTRY" "$work" >"$work/apply.log" 2>&1 || { cat "$work/apply.log" >&2; rm -rf "$work"; die "per-worktree step failed"; }
+  env_diff "$work/before" "$work/after"
+  printf 'export WTENV_ROOT=%s\nexport WTENV_ENTRY=%s\n' "$(shq "$ROOT")" "$(shq "$ENTRY")"
+  touch "$ENTRY/last-used"
+  rm -rf "$work"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_export() {
+  local format=sh timeout=0 nobuild=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    --format) format=$2; shift 2 ;;
+    --timeout) timeout=$2; shift 2 ;;
+    --no-build) nobuild=1; shift ;;
+    *) die "export: unknown argument $1" ;;
+    esac
+  done
+  find_root
+  if ! load_adapter; then
+    [ "$format" = claude ] && echo true
+    return 0
+  fi
+  compute_key
+  local rc=0
+  if [ $nobuild -eq 1 ]; then
+    # A miss is built in the background; this waits for it at most $timeout s.
+    mkdir -p "$CACHE/$KEY"
+    if ! find_entry; then
+      [ -d "$CACHE/$KEY.lock" ] || start_warm
+      local waited=0
+      until find_entry; do
+        if [ "$waited" -ge $((timeout * 10)) ]; then rc=2; break; fi
+        sleep 0.1; waited=$((waited + 1))
+      done
+    fi
+  else
+    ensure_entry "$timeout" || rc=$?
+  fi
+  if [ $rc -eq 2 ]; then echo "wtenv: environment still being built for $ROOT" >&2; return 2; fi
+  render
+  [ -z "${UNCACHED:-}" ] || rm -rf "$ENTRY"
+  [ "$format" = claude ] && echo true
+  return 0
+}
+
+cmd_exec() {
+  [ "${1:-}" = -- ] && shift
+  [ $# -gt 0 ] || die "exec: no command"
+  local out; out="$(WTENV_QUIET=${WTENV_QUIET:-} cmd_export)"
+  eval "$out"
+  exec "$@"
+}
+
+# A detached build of this worktree's entry. With --write FILE, the export is
+# then written to FILE in Claude's format, unless FILE has since been given
+# another root.
+start_warm() {
+  mkdir -p "$CACHE"
+  nohup "$0" _warm "$ROOT" "${WARM_WRITE:-}" </dev/null >/dev/null 2>"$CACHE/warm-$KEY.log" &
+}
+
+cmd_warm() {
+  local write=""
+  [ "${1:-}" = --write ] && write=$2
+  find_root
+  load_adapter || return 0
+  compute_key
+  # A hit still runs once, detached, for the per-worktree step (devenv's
+  # tasks), so the first export a session waits on is a plain hit.
+  WARM_WRITE=$write start_warm
+}
+
+cmd__warm() {
+  local root=$1 write=$2 out
+  cd "$root"
+  out="$(WTENV_QUIET=1 "$0" export --format claude)" || return 1
+  [ -n "$write" ] || return 0
+  # Written only while the file still waits for this root.
+  if grep -qF "export WTENV_PENDING=$(shq "$root")" "$write" 2>/dev/null; then
+    printf '%s\n' "$out" >"$write.wtenv.$$" && mv -f "$write.wtenv.$$" "$write"
+  fi
+}
+
+cmd_gc() {
+  local days=30
+  [ "${1:-}" = --days ] && days=$2
+  find_root
+  local v
+  for v in "$CACHE"/*/*/; do
+    [ -f "$v/last-used" ] || continue
+    if [ -n "$(find "$v/last-used" -mtime +"$days" 2>/dev/null)" ]; then
+      log "dropping ${v%/}"; rm -rf "$v"
+    fi
+  done
+}
+
+cmd_check() {
+  find_root; load_adapter || die "no adapter for $ROOT"
+  local tmp; tmp="$(mktemp -d "${TMPDIR:-/tmp}/wtenv-check.XXXXXX")"
+  (cd "$ROOT" && ad export "$tmp") >"$tmp/export.log" 2>&1 || { cat "$tmp/export.log" >&2; die "export failed"; }
+  local rc=0; (cd "$ROOT" && ad templatize "$tmp") || rc=$?
+  rm -rf "$tmp"; return $rc
+}
+
+cmd_key() {
+  find_root; load_adapter || die "no adapter for $ROOT"
+  compute_key
+  echo "adapter $ADAPTER"; echo "key $KEY"
+  if find_entry; then echo "entry $ENTRY"; else echo "entry none"; fi
+}
+
+main() {
+  local cmd=${1:-}; shift || true
+  case "$cmd" in
+  export) cmd_export "$@" ;;
+  exec) cmd_exec "$@" ;;
+  warm) cmd_warm "$@" ;;
+  _warm) cmd__warm "$@" ;;
+  gc) cmd_gc "$@" ;;
+  check) cmd_check "$@" ;;
+  key) cmd_key "$@" ;;
+  *) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64 ;;
+  esac
+}
+main "$@"

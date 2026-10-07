@@ -1,0 +1,18 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "matcher": "startup|resume|clear|compact",
+        "hooks": [{ "type": "command", "command": "WTENV_BIN=/Users/chuck/Code/github_agentplot/wtenv/spike-wtenv/bin/wtenv sh /Users/chuck/Code/github_agentplot/wtenv/spike-wtenv/claude/hooks/load.sh session-start", "timeout": 30 }] }
+    ],
+    "CwdChanged": [
+      { "hooks": [{ "type": "command", "command": "WTENV_BIN=/Users/chuck/Code/github_agentplot/wtenv/spike-wtenv/bin/wtenv sh /Users/chuck/Code/github_agentplot/wtenv/spike-wtenv/claude/hooks/load.sh cwd-changed", "timeout": 30 }] }
+    ],
+    "FileChanged": [
+      { "hooks": [{ "type": "command", "command": "WTENV_BIN=/Users/chuck/Code/github_agentplot/wtenv/spike-wtenv/bin/wtenv sh /Users/chuck/Code/github_agentplot/wtenv/spike-wtenv/claude/hooks/load.sh file-changed", "timeout": 30 }] }
+    ],
+    "PreToolUse": [
+      { "matcher": "Bash",
+        "hooks": [{ "type": "command", "command": "sh /Users/chuck/Code/github_agentplot/wtenv/spike-wtenv/claude/hooks/guard.sh", "timeout": 30 }] }
+    ]
+  }
+}
