@@ -20,7 +20,9 @@ It ships as three small parts:
 - A Claude Code plugin whose hooks load the environment into every Bash command
   of a session, its subagents included.
 
-Nothing is built yet. The spike that decides the design is in
-[`docs/spike.md`](docs/spike.md).
+The spike that decides the design is in [`docs/spike.md`](docs/spike.md);
+its implementation is `bin/`, `adapters/`, `claude/` and `worktrunk/`, and
+its measurements and the design as it stands are in
+[`docs/spike-results.md`](docs/spike-results.md).
 
 MIT licensed.

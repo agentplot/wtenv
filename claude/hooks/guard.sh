@@ -25,14 +25,25 @@ loaded() { # the root the env files hold; "-" while one waits for a build
     -e "s/^export WTENV_PENDING='.*'\$/-/p" | tail -1
 }
 
-wait=${WTENV_GUARD_WAIT:-20}
-i=0
+# A deadline by the clock, well inside the hook's own timeout: a PreToolUse
+# hook that times out is cancelled and the command runs.
+# A mismatch that outlives a loader's run, with no build pending, is loaded
+# here, into the session's SessionStart file.
+start=$(date +%s)
+deadline=$((start + ${WTENV_GUARD_WAIT:-10}))
+healed=0
 while :; do
   have=$(loaded)
   [ "$have" = "$want" ] && exit 0
-  [ "$i" -ge $((wait * 10)) ] && break
-  sleep 0.1
-  i=$((i + 1))
+  now=$(date +%s)
+  [ "$now" -ge "$deadline" ] && break
+  if [ $healed -eq 0 ] && [ "$have" != "-" ] && [ $((now - start)) -ge 2 ]; then
+    healed=1
+    printf '{"cwd":"%s"}' "$cwd" | CLAUDE_ENV_FILE="$dir/sessionstart-hook-0.sh" \
+      WTENV_BIN="${WTENV_BIN:-$(dirname "$0")/../../bin/wtenv}" sh "$(dirname "$0")/load.sh" heal >/dev/null 2>&1
+    continue
+  fi
+  sleep 0.2
 done
 
 if [ "$have" = "-" ]; then
