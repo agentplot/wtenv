@@ -1,0 +1,6 @@
+{
+  "name": "wtenv",
+  "description": "Loads the worktree's developer environment, from wtenv's machine-wide cache, into every Bash command of a session and its subagents.",
+  "version": "0.0.0-spike",
+  "license": "MIT"
+}

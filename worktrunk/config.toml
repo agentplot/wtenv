@@ -1,0 +1,11 @@
+# Add to ~/.config/worktrunk/config.toml (the user config: its hooks need no
+# per-project approval). Needs wtenv's bin/ on PATH, so `wt env` resolves to
+# bin/wt-env.
+
+# A new worktree's environment is built, or found, in the background before
+# anyone waits on it.
+[post-start]
+env = "wt env warm"
+
+[aliases]
+shell = "wt env exec -- $SHELL"

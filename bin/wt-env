@@ -1,0 +1,4 @@
+#!/bin/sh
+# worktrunk runs an executable `wt-<name>` on PATH as `wt <name>`: this makes
+# wtenv `wt env` (`wt env export`, `wt env exec -- <cmd>`, `wt env warm`).
+exec "$(dirname "$(readlink -f "$0")")/wtenv" "$@"
